@@ -1,0 +1,6 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+stripe==10.12.0
+requests==2.32.3
+supabase==2.22.0
+python-dotenv==1.1.1
