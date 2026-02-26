@@ -2,10 +2,14 @@ import os
 import json
 import stripe
 import requests
+import logging
 from fastapi import FastAPI, Request, HTTPException
 from supabase import create_client
 
 app = FastAPI()
+
+logger = logging.getLogger("mycoordinated_stripe")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 # -----------------------------
 # ENV
@@ -103,12 +107,16 @@ def upsert_user_plan(
     if stripe_subscription_id is not None:
         payload["stripe_subscription_id"] = stripe_subscription_id
 
-    res = (
-        supabase.table("user_plans")
-        .upsert(payload, on_conflict="user_email")
-        .execute()
-    )
-    return res
+    try:
+        res = (
+            supabase.table("user_plans")
+            .upsert(payload, on_conflict="user_email")
+            .execute()
+        )
+        return res
+    except Exception as e:
+        logger.exception("Supabase upsert failed", extra={"payload": payload})
+        raise
 
 
 def _verify_supabase_jwt(access_token: str) -> dict:
@@ -260,6 +268,7 @@ async def stripe_webhook(request: Request):
 
     event_type = event.get("type")
     obj = event.get("data", {}).get("object", {})
+    logger.info("stripe_webhook received", extra={"type": event_type})
 
     def _plan_from_invoice(invoice_obj: dict) -> str:
         """Derive plan from an Invoice object's line items (price id)."""
@@ -335,8 +344,39 @@ async def stripe_webhook(request: Request):
                     stripe_customer_id=customer_id,
                     stripe_subscription_id=sub_id,
                 )
+                logger.info(
+                    "user_plan updated from checkout.session.completed",
+                    extra={
+                        "user_email": user_email,
+                        "plan": plan,
+                        "status": sub_status or "active",
+                        "customer_id": customer_id,
+                        "subscription_id": sub_id,
+                    },
+                )
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Supabase update failed: {e}")
+                # IMPORTANT: don't 500 the webhook; log and allow other events (invoice/subscription.updated)
+                # to reconcile state.
+                logger.exception(
+                    "Supabase update failed in checkout.session.completed",
+                    extra={
+                        "user_email": user_email,
+                        "plan": plan,
+                        "customer_id": customer_id,
+                        "subscription_id": sub_id,
+                        "error": str(e),
+                    },
+                )
+        else:
+            logger.warning(
+                "checkout.session.completed missing user_email or plan",
+                extra={
+                    "user_email": user_email,
+                    "plan": plan,
+                    "customer_id": customer_id,
+                    "subscription_id": sub_id,
+                },
+            )
 
     # -----------------------------
     # 2) invoice.paid / invoice.payment_succeeded / invoice_payment.paid
@@ -402,9 +442,21 @@ async def stripe_webhook(request: Request):
                     stripe_customer_id=customer_id,
                     stripe_subscription_id=sub_id,
                 )
-            except Exception:
-                # Don't fail Stripe delivery; we'll rely on retries / later subscription.updated
-                pass
+                logger.info(
+                    "user_plan updated from invoice handler",
+                    extra={
+                        "user_email": user_email,
+                        "plan": plan,
+                        "status": sub_status or "active",
+                        "customer_id": customer_id,
+                        "subscription_id": sub_id,
+                    },
+                )
+            except Exception as e:
+                logger.exception(
+                    "Supabase update failed in invoice handler",
+                    extra={"user_email": user_email, "plan": plan, "subscription_id": sub_id, "error": str(e)},
+                )
 
     # -----------------------------
     # 3) customer.subscription.updated / deleted (mark inactive)
@@ -437,7 +489,10 @@ async def stripe_webhook(request: Request):
                     update_payload["stripe_subscription_id"] = sub_id
 
                 supabase.table("user_plans").update(update_payload).eq("user_email", user_email).execute()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.exception(
+                    "Supabase update failed in subscription handler",
+                    extra={"user_email": user_email, "subscription_id": sub_id, "error": str(e)},
+                )
 
     return {"received": True, "type": event_type}
