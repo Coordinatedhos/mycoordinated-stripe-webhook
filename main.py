@@ -510,17 +510,29 @@ async def stripe_webhook(request: Request):
             try:
                 update_payload: dict = {
                     "is_active": bool(is_active),
-                    "status": sub_status or ("canceled" if event_type == "customer.subscription.deleted" else ""),
-                    "cancel_at_period_end": bool(cancel_at_period_end) if cancel_at_period_end is not None else False,
+                    "status": sub_status or (
+                        "canceled" if event_type == "customer.subscription.deleted" else ""
+                    ),
+                    "cancel_at_period_end": bool(cancel_at_period_end)
+                    if cancel_at_period_end is not None
+                    else False,
                 }
+
+                # IMPORTANT:
+                # `user_plans.current_period_end` is a timestamptz column in Supabase.
+                # Stripe provides `current_period_end` as unix seconds.
+                # Sending the raw integer causes Postgres to error: date/time field out of range.
                 if current_period_end is not None:
-                    update_payload["current_period_end"] = int(current_period_end)
+                    update_payload["current_period_end"] = _to_timestamptz(current_period_end)
+
                 if customer_id:
                     update_payload["stripe_customer_id"] = customer_id
                 if sub_id:
                     update_payload["stripe_subscription_id"] = sub_id
 
-                supabase.table("user_plans").update(update_payload).eq("user_email", user_email).execute()
+                supabase.table("user_plans").update(update_payload).eq(
+                    "user_email", user_email
+                ).execute()
             except Exception as e:
                 logger.exception(
                     "Supabase update failed in subscription handler",
