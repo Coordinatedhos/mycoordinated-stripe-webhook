@@ -1,7 +1,7 @@
 import os
 import json
-import requests
 import stripe
+import requests
 from fastapi import FastAPI, Request, HTTPException
 from supabase import create_client
 
@@ -16,9 +16,11 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
-# A) Additional env vars
-APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")
-WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
+# Used by /create-checkout-session
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")  # e.g. https://app.mycoordinated.com
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")  # e.g. https://mycoordinated-stripe-webhook.onrender.com
+
+# Stripe price IDs (recommended to keep in env for test/prod separation)
 PRICE_STARTER = os.getenv("STRIPE_PRICE_STARTER", "")
 PRICE_PRO = os.getenv("STRIPE_PRICE_PRO", "")
 
@@ -34,10 +36,7 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
 # Helpers
 # -----------------------------
 def plan_from_price_id(price_id: str | None) -> str | None:
-    """
-    Map Stripe price IDs -> your internal plan names.
-    IMPORTANT: replace these with your real price IDs (you already have them).
-    """
+    """Map Stripe price IDs -> your internal plan names."""
     if not price_id:
         return None
 
@@ -49,7 +48,6 @@ def plan_from_price_id(price_id: str | None) -> str | None:
     return None
 
 
-# B) Map plan name -> Stripe price ID
 def price_id_from_plan(plan: str) -> str | None:
     plan = (plan or "").strip().lower()
     if plan == "starter":
@@ -59,9 +57,26 @@ def price_id_from_plan(plan: str) -> str | None:
     return None
 
 
-def upsert_user_plan(user_email: str, plan: str, is_active: bool = True):
+def upsert_user_plan(
+    user_email: str,
+    plan: str,
+    is_active: bool = True,
+    status: str | None = None,
+    cancel_at_period_end: bool | None = None,
+    current_period_end: int | None = None,
+    stripe_customer_id: str | None = None,
+    stripe_subscription_id: str | None = None,
+):
+    """Upsert subscription state into `user_plans`.
+
+    Notes:
+    - `current_period_end` is a Stripe unix timestamp (seconds).
+    - Keep the table flexible: only write optional fields when provided.
+    """
     if not supabase:
-        raise RuntimeError("Supabase not configured (missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY).")
+        raise RuntimeError(
+            "Supabase not configured (missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)."
+        )
 
     user_email = (user_email or "").strip().lower()
     plan = (plan or "").strip().lower()
@@ -71,14 +86,92 @@ def upsert_user_plan(user_email: str, plan: str, is_active: bool = True):
     if plan not in ("starter", "pro", "enterprise"):
         raise ValueError(f"Invalid plan: {plan}")
 
-    # Upsert into user_plans table
-    # Expecting columns: user_email (unique), plan, is_active
+    payload: dict = {
+        "user_email": user_email,
+        "plan": plan,
+        "is_active": bool(is_active),
+    }
+
+    if status is not None:
+        payload["status"] = status
+    if cancel_at_period_end is not None:
+        payload["cancel_at_period_end"] = bool(cancel_at_period_end)
+    if current_period_end is not None:
+        payload["current_period_end"] = int(current_period_end)
+    if stripe_customer_id is not None:
+        payload["stripe_customer_id"] = stripe_customer_id
+    if stripe_subscription_id is not None:
+        payload["stripe_subscription_id"] = stripe_subscription_id
+
     res = (
         supabase.table("user_plans")
-        .upsert({"user_email": user_email, "plan": plan, "is_active": is_active}, on_conflict="user_email")
+        .upsert(payload, on_conflict="user_email")
         .execute()
     )
     return res
+
+
+def _verify_supabase_jwt(access_token: str) -> dict:
+    """
+    Verify user is logged in by calling Supabase Auth /user endpoint.
+    Returns the user json (must contain email).
+    """
+    if not SUPABASE_URL:
+        raise HTTPException(status_code=500, detail="SUPABASE_URL not set.")
+
+    r = requests.get(
+        f"{SUPABASE_URL}/auth/v1/user",
+        headers={"Authorization": f"Bearer {access_token}", "apikey": SUPABASE_SERVICE_ROLE_KEY or ""},
+        timeout=15,
+    )
+    if not r.ok:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {r.text}")
+
+    u = r.json() or {}
+    email = (u.get("email") or u.get("user_metadata", {}).get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=401, detail="Token valid but email missing.")
+    return u
+
+
+def _session_belongs_to_email(sess: dict, email: str) -> bool:
+    """
+    Extra safety: ensure the session we are about to trust belongs to the user.
+    """
+    email = (email or "").strip().lower()
+    if not email:
+        return False
+
+    # Stripe may set customer_email on the session; metadata also has it (we set it)
+    sess_email = (sess.get("customer_email") or "").strip().lower()
+    meta = sess.get("metadata") or {}
+    meta_email = (meta.get("user_email") or "").strip().lower()
+
+    if sess_email and sess_email == email:
+        return True
+    if meta_email and meta_email == email:
+        return True
+    return False
+
+
+def _email_from_customer_id(customer_id: str | None) -> str:
+    if not customer_id:
+        return ""
+    try:
+        cust = stripe.Customer.retrieve(customer_id)
+        email = (getattr(cust, "email", None) or (cust.get("email") if isinstance(cust, dict) else "") or "").strip().lower()
+        return email
+    except Exception:
+        return ""
+
+
+def _email_from_invoice(obj: dict) -> str:
+    # Invoice often has `customer` but not `customer_email` (that field is mostly for legacy invoicing)
+    email = (obj.get("customer_email") or "").strip().lower()
+    if email:
+        return email
+    customer_id = obj.get("customer")
+    return _email_from_customer_id(customer_id)
 
 
 # -----------------------------
@@ -89,13 +182,23 @@ def health():
     return {"ok": True}
 
 
-# C) Create Stripe Checkout Session
 @app.post("/create-checkout-session")
 async def create_checkout_session(request: Request):
+    """
+    Creates a Stripe Checkout Session for the signed-in user.
+
+    Streamlit should call this endpoint with:
+      Authorization: Bearer <SUPABASE_ACCESS_TOKEN>
+      JSON body: { "plan": "starter" | "pro" }
+
+    Returns: { "url": "<stripe_checkout_url>" }
+    """
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY not set.")
     if not APP_BASE_URL:
         raise HTTPException(status_code=500, detail="APP_BASE_URL not set.")
+    if not WEBHOOK_BASE_URL:
+        raise HTTPException(status_code=500, detail="WEBHOOK_BASE_URL not set.")
     if not (PRICE_STARTER and PRICE_PRO):
         raise HTTPException(status_code=500, detail="Missing STRIPE_PRICE_STARTER / STRIPE_PRICE_PRO.")
 
@@ -109,25 +212,9 @@ async def create_checkout_session(request: Request):
     if plan not in ("starter", "pro"):
         raise HTTPException(status_code=400, detail="plan must be 'starter' or 'pro'.")
 
-    # Verify token + get email (service role key is required for this to work reliably)
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        raise HTTPException(status_code=500, detail="Supabase not configured for auth verify.")
-
-    r = requests.get(
-        f"{SUPABASE_URL}/auth/v1/user",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        },
-        timeout=15,
-    )
-    if not r.ok:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {r.text}")
-
-    u = r.json() or {}
+    # Verify Supabase user
+    u = _verify_supabase_jwt(access_token)
     email = (u.get("email") or u.get("user_metadata", {}).get("email") or "").strip().lower()
-    if not email:
-        raise HTTPException(status_code=401, detail="Token valid but email missing.")
 
     price_id = price_id_from_plan(plan)
     if not price_id:
@@ -136,17 +223,20 @@ async def create_checkout_session(request: Request):
     success_url = f"{APP_BASE_URL}/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url = f"{APP_BASE_URL}/?checkout=cancel"
 
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        line_items=[{"price": price_id, "quantity": 1}],
-        success_url=success_url,
-        cancel_url=cancel_url,
-        customer_email=email,
-        client_reference_id=email,
-        metadata={"plan": plan, "user_email": email},
-        allow_promotion_codes=True,
-    )
-    return {"url": session.url}
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            customer_email=email,
+            client_reference_id=email,
+            metadata={"plan": plan, "user_email": email},
+            allow_promotion_codes=True,
+        )
+        return {"url": session.url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stripe error creating checkout session: {e}")
 
 
 @app.post("/stripe/webhook")
@@ -155,7 +245,7 @@ async def stripe_webhook(request: Request):
         raise HTTPException(status_code=500, detail="STRIPE_WEBHOOK_SECRET not set.")
 
     payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
+    sig_header = request.headers.get("stripe-signature") or request.headers.get("Stripe-Signature")
 
     try:
         event = stripe.Webhook.construct_event(
@@ -171,12 +261,30 @@ async def stripe_webhook(request: Request):
     event_type = event.get("type")
     obj = event.get("data", {}).get("object", {})
 
+    def _plan_from_invoice(invoice_obj: dict) -> str:
+        """Derive plan from an Invoice object's line items (price id)."""
+        try:
+            lines = (invoice_obj.get("lines") or {}).get("data") or []
+            if not lines:
+                return ""
+            price = (lines[0].get("price") or {})
+            price_id = price.get("id")
+            return plan_from_price_id(price_id) or ""
+        except Exception:
+            return ""
+
+    def _email_from_invoice_obj(invoice_obj: dict) -> str:
+        """Best-effort email extraction from an Invoice object."""
+        email = (invoice_obj.get("customer_email") or "").strip().lower()
+        if email:
+            return email
+        customer_id = invoice_obj.get("customer")
+        return _email_from_customer_id(customer_id)
+
     # -----------------------------
     # 1) checkout.session.completed (best first hook)
     # -----------------------------
     if event_type == "checkout.session.completed":
-        # You pass metadata in create_checkout_session():
-        # metadata={"plan": plan, "user_email": user_email}
         metadata = obj.get("metadata") or {}
         user_email = (metadata.get("user_email") or obj.get("customer_email") or "").strip().lower()
         plan = (metadata.get("plan") or "").strip().lower()
@@ -191,30 +299,145 @@ async def stripe_webhook(request: Request):
             except Exception:
                 plan = ""
 
+        # Pull subscription state from Stripe (preferred)
+        sub_id = obj.get("subscription")
+        customer_id = obj.get("customer")
+        sub_status = None
+        cancel_at_period_end = None
+        current_period_end = None
+
+        if sub_id:
+            try:
+                sub = stripe.Subscription.retrieve(sub_id)
+                # Stripe subscription fields
+                sub_status = (sub.get("status") if isinstance(sub, dict) else getattr(sub, "status", None))
+                cancel_at_period_end = (
+                    sub.get("cancel_at_period_end") if isinstance(sub, dict) else getattr(sub, "cancel_at_period_end", None)
+                )
+                current_period_end = (
+                    sub.get("current_period_end") if isinstance(sub, dict) else getattr(sub, "current_period_end", None)
+                )
+                # If email wasn't present on session, try customer lookup
+                if not user_email and customer_id:
+                    user_email = _email_from_customer_id(customer_id)
+            except Exception:
+                pass
+
         if user_email and plan:
             try:
-                upsert_user_plan(user_email, plan, is_active=True)
+                upsert_user_plan(
+                    user_email,
+                    plan,
+                    is_active=True,
+                    status=sub_status or "active",
+                    cancel_at_period_end=False,
+                    current_period_end=current_period_end,
+                    stripe_customer_id=customer_id,
+                    stripe_subscription_id=sub_id,
+                )
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Supabase update failed: {e}")
 
     # -----------------------------
-    # 2) invoice.payment_succeeded (keeps plan active on renewals)
+    # 2) invoice.paid / invoice.payment_succeeded / invoice_payment.paid
     # -----------------------------
-    elif event_type == "invoice.payment_succeeded":
-        customer_email = (obj.get("customer_email") or "").strip().lower()
-        if customer_email:
+    elif event_type in ("invoice.paid", "invoice.payment_succeeded", "invoice_payment.paid"):
+        # Stripe sometimes emits `invoice_payment.paid` with object type `invoice_payment`.
+        # That object contains an `invoice` id; we then fetch the full Invoice to derive plan + subscription.
+
+        invoice_obj = None
+        if event_type == "invoice_payment.paid":
+            invoice_id = obj.get("invoice")
+            if invoice_id:
+                try:
+                    invoice_obj = stripe.Invoice.retrieve(invoice_id)
+                    if not isinstance(invoice_obj, dict):
+                        invoice_obj = dict(invoice_obj)
+                except Exception:
+                    invoice_obj = None
+        else:
+            # `invoice.paid` / `invoice.payment_succeeded` usually provide the full invoice object
+            invoice_obj = obj
+
+        if not invoice_obj:
+            return {"received": True, "type": event_type}
+
+        # Identify the user + plan
+        user_email = _email_from_invoice_obj(invoice_obj)
+        customer_id = invoice_obj.get("customer")
+        sub_id = invoice_obj.get("subscription")
+
+        plan = (invoice_obj.get("metadata") or {}).get("plan")
+        plan = (plan or "").strip().lower()
+        if not plan:
+            plan = _plan_from_invoice(invoice_obj)
+
+        # Pull subscription state from Stripe (preferred)
+        sub_status = None
+        cancel_at_period_end = None
+        current_period_end = None
+
+        if sub_id:
             try:
-                # Keep whatever plan already exists, just ensure active
-                supabase.table("user_plans").update({"is_active": True}).eq("user_email", customer_email).execute()
+                sub = stripe.Subscription.retrieve(sub_id)
+                sub_status = (sub.get("status") if isinstance(sub, dict) else getattr(sub, "status", None))
+                cancel_at_period_end = (
+                    sub.get("cancel_at_period_end") if isinstance(sub, dict) else getattr(sub, "cancel_at_period_end", None)
+                )
+                current_period_end = (
+                    sub.get("current_period_end") if isinstance(sub, dict) else getattr(sub, "current_period_end", None)
+                )
             except Exception:
                 pass
 
+        if user_email and plan:
+            try:
+                upsert_user_plan(
+                    user_email=user_email,
+                    plan=plan,
+                    is_active=True,
+                    status=sub_status or "active",
+                    cancel_at_period_end=False if cancel_at_period_end is None else bool(cancel_at_period_end),
+                    current_period_end=current_period_end,
+                    stripe_customer_id=customer_id,
+                    stripe_subscription_id=sub_id,
+                )
+            except Exception:
+                # Don't fail Stripe delivery; we'll rely on retries / later subscription.updated
+                pass
+
     # -----------------------------
-    # 3) customer.subscription.deleted (mark inactive)
+    # 3) customer.subscription.updated / deleted (mark inactive)
     # -----------------------------
-    elif event_type == "customer.subscription.deleted":
-        # Usually no email; you'd map customer->user in DB for perfect handling.
-        # For now: do nothing unless you store customer_id somewhere.
-        pass
+    elif event_type in ("customer.subscription.updated", "customer.subscription.deleted"):
+        # Keep DB aligned with Stripe subscription state changes.
+        customer_id = obj.get("customer")
+        user_email = _email_from_customer_id(customer_id)
+
+        sub_status = (obj.get("status") or "").strip()
+        cancel_at_period_end = obj.get("cancel_at_period_end")
+        current_period_end = obj.get("current_period_end")
+        sub_id = obj.get("id")
+
+        # If subscription is deleted, it is not active.
+        is_active = False if event_type == "customer.subscription.deleted" else (sub_status == "active")
+
+        if user_email and supabase:
+            try:
+                update_payload: dict = {
+                    "is_active": bool(is_active),
+                    "status": sub_status or ("canceled" if event_type == "customer.subscription.deleted" else ""),
+                    "cancel_at_period_end": bool(cancel_at_period_end) if cancel_at_period_end is not None else False,
+                }
+                if current_period_end is not None:
+                    update_payload["current_period_end"] = int(current_period_end)
+                if customer_id:
+                    update_payload["stripe_customer_id"] = customer_id
+                if sub_id:
+                    update_payload["stripe_subscription_id"] = sub_id
+
+                supabase.table("user_plans").update(update_payload).eq("user_email", user_email).execute()
+            except Exception:
+                pass
 
     return {"received": True, "type": event_type}
