@@ -3,6 +3,7 @@ import json
 import stripe
 import requests
 import logging
+from datetime import datetime, timezone
 from fastapi import FastAPI, Request, HTTPException
 from supabase import create_client
 
@@ -101,7 +102,8 @@ def upsert_user_plan(
     if cancel_at_period_end is not None:
         payload["cancel_at_period_end"] = bool(cancel_at_period_end)
     if current_period_end is not None:
-        payload["current_period_end"] = int(current_period_end)
+        # Store as timestamptz (ISO-8601) to match Supabase column type
+        payload["current_period_end"] = _to_timestamptz(current_period_end)
     if stripe_customer_id is not None:
         payload["stripe_customer_id"] = stripe_customer_id
     if stripe_subscription_id is not None:
@@ -181,6 +183,36 @@ def _email_from_invoice(obj: dict) -> str:
     customer_id = obj.get("customer")
     return _email_from_customer_id(customer_id)
 
+
+# -----------------------------
+# -----------------------------
+# Helpers
+# -----------------------------
+def _to_timestamptz(value: int | str | None) -> str | None:
+    """Convert a Stripe unix timestamp (seconds) to an ISO-8601 timestamptz string.
+
+    Your Supabase `user_plans.current_period_end` column appears to be a date/timestamp type.
+    Stripe provides `current_period_end` as unix seconds (e.g. 1774547316).
+    Sending that integer directly causes Postgres to try parsing it as a date string.
+    """
+    if value is None:
+        return None
+
+    # Sometimes Stripe/lib returns ints; sometimes strings.
+    if isinstance(value, str):
+        v = value.strip()
+        if not v:
+            return None
+        if v.isdigit():
+            value_int = int(v)
+        else:
+            # Already an ISO timestamp or some other string — pass through.
+            return v
+    else:
+        value_int = int(value)
+
+    # Stripe timestamps are seconds since epoch.
+    return datetime.fromtimestamp(value_int, tz=timezone.utc).isoformat()
 
 # -----------------------------
 # Routes
