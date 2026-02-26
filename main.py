@@ -263,6 +263,7 @@ async def create_checkout_session(request: Request):
     success_url = f"{APP_BASE_URL}/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url = f"{APP_BASE_URL}/?checkout=cancel"
 
+
     try:
         session = stripe.checkout.Session.create(
             mode="subscription",
@@ -277,6 +278,108 @@ async def create_checkout_session(request: Request):
         return {"url": session.url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Stripe error creating checkout session: {e}")
+
+
+# -----------------------------
+# Cancel Subscription Route and Helper
+# -----------------------------
+
+def _get_user_plan_row(user_email: str) -> dict | None:
+    """Fetch the current user_plans row for an email (service role)."""
+    if not supabase:
+        return None
+    user_email = (user_email or "").strip().lower()
+    if not user_email:
+        return None
+
+    try:
+        res = (
+            supabase.table("user_plans")
+            .select(
+                "user_email,plan,status,is_active,cancel_at_period_end,current_period_end,stripe_customer_id,stripe_subscription_id"
+            )
+            .eq("user_email", user_email)
+            .limit(1)
+            .execute()
+        )
+        data = getattr(res, "data", None) or (res.get("data") if isinstance(res, dict) else None) or []
+        return data[0] if data else None
+    except Exception:
+        logger.exception("Failed to fetch user_plans row", extra={"user_email": user_email})
+        return None
+
+
+@app.post("/cancel-subscription")
+async def cancel_subscription(request: Request):
+    """
+    Cancel a user's subscription.
+
+    Streamlit should call this endpoint with:
+      Authorization: Bearer <SUPABASE_ACCESS_TOKEN>
+      JSON body: { "mode": "period_end" | "immediate" }
+
+    - period_end: sets Stripe `cancel_at_period_end=True` (recommended)
+    - immediate: cancels immediately in Stripe
+
+    IMPORTANT: Stripe is the source of truth. Supabase is updated via webhook events.
+    """
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY not set.")
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured.")
+
+    auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization: Bearer <token> header.")
+    access_token = auth.split(" ", 1)[1].strip()
+
+    body = await request.json()
+    mode = (body.get("mode") or "period_end").strip().lower()
+    if mode not in ("period_end", "immediate"):
+        raise HTTPException(status_code=400, detail="mode must be 'period_end' or 'immediate'.")
+
+    # Verify Supabase user
+    u = _verify_supabase_jwt(access_token)
+    user_email = (u.get("email") or u.get("user_metadata", {}).get("email") or "").strip().lower()
+    if not user_email:
+        raise HTTPException(status_code=401, detail="Authenticated user email missing.")
+
+    # Find subscription id (prefer DB; fallback to Stripe customer lookup)
+    row = _get_user_plan_row(user_email)
+    sub_id = (row or {}).get("stripe_subscription_id")
+    cust_id = (row or {}).get("stripe_customer_id")
+
+    if not sub_id and cust_id:
+        try:
+            subs = stripe.Subscription.list(customer=cust_id, status="all", limit=10)
+            # pick latest non-canceled subscription if present
+            for s in subs.data:
+                s_status = (s.get("status") if isinstance(s, dict) else getattr(s, "status", "")) or ""
+                if s_status not in ("canceled",):
+                    sub_id = s.get("id") if isinstance(s, dict) else getattr(s, "id", None)
+                    break
+            if not sub_id and subs.data:
+                s0 = subs.data[0]
+                sub_id = s0.get("id") if isinstance(s0, dict) else getattr(s0, "id", None)
+        except Exception:
+            logger.exception("Failed to list subscriptions for customer", extra={"user_email": user_email, "customer_id": cust_id})
+
+    if not sub_id:
+        raise HTTPException(status_code=404, detail="No Stripe subscription found for this user.")
+
+    try:
+        if mode == "period_end":
+            stripe.Subscription.modify(sub_id, cancel_at_period_end=True)
+        else:
+            # Cancel immediately
+            stripe.Subscription.delete(sub_id)
+
+        # Do NOT force-update Supabase here. Webhook events will mirror Stripe state.
+        return {"ok": True, "mode": mode, "subscription_id": sub_id}
+
+    except Exception as e:
+        logger.exception("Stripe cancellation failed", extra={"user_email": user_email, "subscription_id": sub_id, "mode": mode})
+        raise HTTPException(status_code=500, detail=f"Stripe cancellation failed: {e}")
 
 
 @app.post("/stripe/webhook")
